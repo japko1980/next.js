@@ -10,7 +10,7 @@ import { promisify } from 'util'
 import http from 'http'
 import path from 'path'
 
-import cheerio from 'cheerio'
+import type cheerio from 'cheerio'
 import spawn from 'cross-spawn'
 import { writeFile } from 'fs-extra'
 import getPort from 'get-port'
@@ -26,7 +26,7 @@ import _pkg from 'next/package.json'
 import type { SpawnOptions, ChildProcess } from 'child_process'
 import type { RequestInit, Response } from 'node-fetch'
 import type { NextServer } from 'next/dist/server/next'
-import type { BrowserInterface } from './browsers/base'
+import { BrowserInterface } from './browsers/base'
 
 import { getTurbopackFlag, shouldRunTurboDevTest } from './turbo'
 import stripAnsi from 'strip-ansi'
@@ -35,6 +35,10 @@ export { shouldRunTurboDevTest }
 
 export const nextServer = server
 export const pkg = _pkg
+
+// TODO(jiwon): Remove this once we have a new dev overlay at stable.
+const isNewDevOverlay =
+  process.env.__NEXT_EXPERIMENTAL_NEW_DEV_OVERLAY === 'true'
 
 export function initNextServerScript(
   scriptPath: string,
@@ -46,6 +50,8 @@ export function initNextServerScript(
     nodeArgs?: string[]
     onStdout?: (data: any) => void
     onStderr?: (data: any) => void
+    // If true, the promise will reject if the process exits with a non-zero code
+    shouldRejectOnError?: boolean
   }
 ): Promise<ChildProcess> {
   return new Promise((resolve, reject) => {
@@ -81,6 +87,14 @@ export function initNextServerScript(
       if (opts && opts.onStderr) {
         opts.onStderr(message.toString())
       }
+    }
+
+    if (opts?.shouldRejectOnError) {
+      instance.on('exit', (code) => {
+        if (code !== 0) {
+          reject(new Error('exited with code: ' + code))
+        }
+      })
     }
 
     instance.stdout.on('data', handleStdout)
@@ -146,6 +160,15 @@ export function withQuery(
   }
 
   return `${pathname}?${querystring}`
+}
+
+export function getFetchUrl(
+  appPort: string | number,
+  pathname: string,
+  query?: Record<string, any> | string | null | undefined
+) {
+  const url = query ? withQuery(pathname, query) : pathname
+  return getFullUrl(appPort, url)
 }
 
 export function fetchViaHTTP(
@@ -628,8 +651,21 @@ export async function stopApp(server: http.Server | undefined) {
   await promisify(server.close).apply(server)
 }
 
-export function waitFor(millis: number) {
-  return new Promise((resolve) => setTimeout(resolve, millis))
+export async function waitFor(
+  millisOrCondition: number | (() => boolean)
+): Promise<void> {
+  if (typeof millisOrCondition === 'number') {
+    return new Promise((resolve) => setTimeout(resolve, millisOrCondition))
+  }
+
+  return new Promise((resolve) => {
+    const interval = setInterval(() => {
+      if (millisOrCondition()) {
+        clearInterval(interval)
+        resolve()
+      }
+    }, 100)
+  })
 }
 
 export async function startStaticServer(
@@ -662,7 +698,7 @@ export async function startCleanStaticServer(dir: string) {
 
 /**
  * Check for content in 1 second intervals timing out after 30 seconds.
- *
+ * @deprecated use retry + expect instead
  * @param {() => Promise<unknown> | unknown} contentFn
  * @param {RegExp | string | number} regex
  * @param {boolean} hardError
@@ -757,19 +793,6 @@ export class File {
   }
 }
 
-export async function evaluate(
-  browser: BrowserInterface,
-  input: string | Function
-) {
-  if (typeof input === 'function') {
-    const result = await browser.eval(input)
-    await new Promise((resolve) => setTimeout(resolve, 30))
-    return result
-  } else {
-    throw new Error(`You must pass a function to be evaluated in the browser.`)
-  }
-}
-
 export async function retry<T>(
   fn: () => T | Promise<T>,
   duration: number = 3000,
@@ -794,7 +817,7 @@ export async function retry<T>(
         )
         throw err
       }
-      console.warn(
+      console.log(
         `Retrying${description ? ` ${description}` : ''} in ${interval}ms`
       )
       await waitFor(interval)
@@ -806,7 +829,7 @@ export async function assertHasRedbox(browser: BrowserInterface) {
   try {
     await retry(
       async () => {
-        const hasRedbox = await evaluate(browser, () => {
+        const hasRedbox = await browser.eval(() => {
           return Boolean(
             [].slice
               .call(document.querySelectorAll('nextjs-portal'))
@@ -831,7 +854,7 @@ export async function assertHasRedbox(browser: BrowserInterface) {
 
 export async function assertNoRedbox(browser: BrowserInterface) {
   await waitFor(5000)
-  const hasRedbox = await evaluate(browser, () => {
+  const hasRedbox = await browser.eval(() => {
     return Boolean(
       [].slice
         .call(document.querySelectorAll('nextjs-portal'))
@@ -844,8 +867,19 @@ export async function assertNoRedbox(browser: BrowserInterface) {
   })
 
   if (hasRedbox) {
-    const error = new Error('Expected no Redbox but found one')
-    Error.captureStackTrace(error, assertHasRedbox)
+    const [redboxHeader, redboxDescription, redboxSource] = await Promise.all([
+      getRedboxHeader(browser).catch(() => '<missing>'),
+      getRedboxDescription(browser).catch(() => '<missing>'),
+      getRedboxSource(browser).catch(() => '<missing>'),
+    ])
+
+    const error = new Error(
+      'Expected no Redbox but found one\n' +
+        `header: ${redboxHeader}\n` +
+        `description: ${redboxDescription}\n` +
+        `source: ${redboxSource}`
+    )
+    Error.captureStackTrace(error, assertNoRedbox)
     throw error
   }
 }
@@ -853,108 +887,183 @@ export async function assertNoRedbox(browser: BrowserInterface) {
 export async function hasErrorToast(
   browser: BrowserInterface
 ): Promise<boolean> {
-  return browser.eval(() => {
-    return Boolean(
-      Array.from(document.querySelectorAll('nextjs-portal')).find((p) =>
-        p.shadowRoot.querySelector('[data-nextjs-toast]')
+  return (
+    (await browser.eval(() => {
+      return Boolean(
+        [].slice.call(document.querySelectorAll('nextjs-portal')).find((p) =>
+          p.shadowRoot.querySelector(
+            // TODO(jiwon): data-nextjs-toast may not be an error indicator in new UI
+            isNewDevOverlay ? '[data-issues]' : '[data-nextjs-toast]'
+          )
+        )
       )
-    )
+    })) ?? false // When browser.eval() throws, it returns null.
+  )
+}
+
+/**
+ * Has retried version of {@link hasErrorToast} built-in.
+ * Success implies {@link assertHasRedbox}.
+ */
+export async function openRedbox(browser: BrowserInterface): Promise<void> {
+  try {
+    //TODO(jiwon): data-nextjs-toast won't open red box in new UI.
+    if (isNewDevOverlay) {
+      await browser.waitForElementByCss('[data-error-expanded="true"]')
+      await browser.waitForElementByCss('[data-issues-open]').click()
+    } else {
+      await browser.waitForElementByCss('[data-nextjs-toast]').click()
+    }
+  } catch (cause) {
+    const error = new Error('No Redbox to open.', { cause })
+    Error.captureStackTrace(error, openRedbox)
+    throw error
+  }
+  await assertHasRedbox(browser)
+}
+
+export async function openDevToolsIndicatorPopover(
+  browser: BrowserInterface
+): Promise<void> {
+  try {
+    await browser.waitForElementByCss('[data-nextjs-dev-tools-button]').click()
+  } catch (cause) {
+    const error = new Error('No DevTools Indicator to open.', { cause })
+    Error.captureStackTrace(error, openDevToolsIndicatorPopover)
+    throw error
+  }
+}
+
+export async function getRouteTypeFromDevToolsIndicator(
+  browser: BrowserInterface
+): Promise<'Static' | 'Dynamic'> {
+  await openDevToolsIndicatorPopover(browser)
+
+  return browser.eval(() => {
+    const portal = [].slice
+      .call(document.querySelectorAll('nextjs-portal'))
+      .find((p) => p.shadowRoot.querySelector('[data-nextjs-toast]'))
+
+    const root = portal?.shadowRoot
+
+    // 'Route\nStatic' || 'Route\nDynamic'
+    const routeTypeText = root?.querySelector(
+      '[data-nextjs-route-type]'
+    )?.innerText
+
+    if (!routeTypeText) {
+      throw new Error('No Route Type Text Found')
+    }
+
+    // 'Static' || 'Dynamic'
+    const routeType = routeTypeText.split('\n').pop()
+    if (routeType !== 'Static' && routeType !== 'Dynamic') {
+      throw new Error(`Invalid Route Type: ${routeType}`)
+    }
+
+    return routeType as 'Static' | 'Dynamic'
   })
 }
 
-export async function waitForAndOpenRuntimeError(browser: BrowserInterface) {
-  return browser.waitForElementByCss('[data-nextjs-toast]').click()
+export function getRedboxHeader(browser: BrowserInterface) {
+  return browser.eval(() => {
+    const portal = [].slice
+      .call(document.querySelectorAll('nextjs-portal'))
+      .find((p) => p.shadowRoot.querySelector('[data-nextjs-dialog-header]'))
+    const root = portal?.shadowRoot
+    return root?.querySelector('[data-nextjs-dialog-header]')?.innerText
+  })
 }
 
-export async function getRedboxHeader(browser: BrowserInterface) {
-  return retry(
-    () => {
-      return evaluate(browser, () => {
-        const portal = [].slice
-          .call(document.querySelectorAll('nextjs-portal'))
-          .find((p) =>
-            p.shadowRoot.querySelector('[data-nextjs-dialog-header]')
-          )
-        const root = portal?.shadowRoot
-        return root?.querySelector('[data-nextjs-dialog-header]')?.innerText
-      })
-    },
-    10000,
-    500,
-    'getRedboxHeader'
-  )
+export function getRedboxFloatingHeaderText(
+  browser: BrowserInterface
+): Promise<string> {
+  return browser.eval(() => {
+    const portal = [].slice
+      .call(document.querySelectorAll('nextjs-portal'))
+      .find((p) => p.shadowRoot.querySelector('.error-overlay-floating-header'))
+    const root = portal.shadowRoot
+    return root.querySelector('.error-overlay-floating-header')?.innerText
+  })
 }
 
 export async function getRedboxTotalErrorCount(browser: BrowserInterface) {
-  return parseInt(
-    (await getRedboxHeader(browser)).match(/\d+ of (\d+) error/)?.[1],
-    10
-  )
+  // TODO(jiwon): Remove this once we have a new dev overlay at stable.
+  if (isNewDevOverlay) {
+    // N/M\nNext.js X.Y.Z -> M
+    const text = (await getRedboxFloatingHeaderText(browser)) || ''
+    return parseInt(text.match(/\/(\d+)/)?.[1])
+  }
+
+  const header = (await getRedboxHeader(browser)) || ''
+  return parseInt(header.match(/\d+ of (\d+) issue/)?.[1], 10)
 }
 
-export async function getRedboxSource(browser: BrowserInterface) {
-  return retry(
-    () =>
-      evaluate(browser, () => {
-        const portal = [].slice
-          .call(document.querySelectorAll('nextjs-portal'))
-          .find((p) =>
-            p.shadowRoot.querySelector(
-              '#nextjs__container_errors_label, #nextjs__container_errors_label'
-            )
-          )
-        const root = portal.shadowRoot
-        return root.querySelector(
-          '[data-nextjs-codeframe], [data-nextjs-terminal]'
-        ).innerText
-      }),
-    10000,
-    500,
-    'getRedboxSource'
-  )
+export function getRedboxSource(browser: BrowserInterface) {
+  return browser.eval(() => {
+    const portal = [].slice
+      .call(document.querySelectorAll('nextjs-portal'))
+      .find((p) =>
+        p.shadowRoot.querySelector(
+          '#nextjs__container_errors_label, #nextjs__container_errors_label'
+        )
+      )
+    const root = portal.shadowRoot
+    return root.querySelector('[data-nextjs-codeframe], [data-nextjs-terminal]')
+      .innerText
+  })
 }
 
-export async function getRedboxDescription(browser: BrowserInterface) {
-  return retry(
-    () =>
-      evaluate(browser, () => {
-        const portal = [].slice
-          .call(document.querySelectorAll('nextjs-portal'))
-          .find((p) =>
-            p.shadowRoot.querySelector('[data-nextjs-dialog-header]')
-          )
-        const root = portal.shadowRoot
-        const text = root.querySelector(
-          '#nextjs__container_errors_desc'
-        ).innerText
-        if (text === null) throw new Error('No redbox description found')
-        return text
-      }),
-    3000,
-    500,
-    'getRedboxDescription'
-  )
+export function getRedboxTitle(browser: BrowserInterface) {
+  return browser.eval(() => {
+    const portal = [].slice
+      .call(document.querySelectorAll('nextjs-portal'))
+      .find((p) => p.shadowRoot.querySelector('[data-nextjs-dialog-header]'))
+    const root = portal.shadowRoot
+    return root.querySelector(
+      '[data-nextjs-dialog-header] .nextjs__container_errors__error_title'
+    ).innerText
+  })
 }
 
-export async function getRedboxDescriptionWarning(browser: BrowserInterface) {
-  return retry(
-    () =>
-      evaluate(browser, () => {
-        const portal = [].slice
-          .call(document.querySelectorAll('nextjs-portal'))
-          .find((p) =>
-            p.shadowRoot.querySelector('[data-nextjs-dialog-header]')
-          )
-        const root = portal.shadowRoot
-        const text = root.querySelector(
-          '#nextjs__container_errors__notes'
-        )?.innerText
-        return text
-      }),
-    3000,
-    500,
-    'getRedboxDescriptionWarning'
-  )
+export function getRedboxDescription(browser: BrowserInterface) {
+  return browser.eval(() => {
+    const portal = [].slice
+      .call(document.querySelectorAll('nextjs-portal'))
+      .find((p) => p.shadowRoot.querySelector('[data-nextjs-dialog-header]'))
+    const root = portal.shadowRoot
+    const text = root.querySelector('#nextjs__container_errors_desc').innerText
+    if (text === null) throw new Error('No redbox description found')
+    return text
+  })
+}
+
+export function getRedboxDescriptionWarning(browser: BrowserInterface) {
+  return browser.eval(() => {
+    const portal = [].slice
+      .call(document.querySelectorAll('nextjs-portal'))
+      .find((p) => p.shadowRoot.querySelector('[data-nextjs-dialog-header]'))
+    const root = portal.shadowRoot
+    const text = root.querySelector(
+      '#nextjs__container_errors__notes'
+    )?.innerText
+    return text
+  })
+}
+
+export function getRedboxErrorLink(
+  browser: BrowserInterface
+): Promise<string | undefined> {
+  return browser.eval(() => {
+    const portal = [].slice
+      .call(document.querySelectorAll('nextjs-portal'))
+      .find((p) => p.shadowRoot.querySelector('[data-nextjs-dialog-header]'))
+    const root = portal.shadowRoot
+    const text = root.querySelector(
+      '#nextjs__container_errors__link'
+    )?.innerText
+    return text
+  })
 }
 
 export function getBrowserBodyText(browser: BrowserInterface) {
@@ -973,12 +1082,33 @@ export function getBuildManifest(dir: string) {
   return readJson(path.join(dir, '.next/build-manifest.json'))
 }
 
-export function getPageFileFromBuildManifest(dir: string, page: string) {
+export function getImagesManifest(dir: string) {
+  return readJson(path.join(dir, '.next/images-manifest.json'))
+}
+
+export function getPageFilesFromBuildManifest(dir: string, page: string) {
   const buildManifest = getBuildManifest(dir)
   const pageFiles = buildManifest.pages[page]
   if (!pageFiles) {
     throw new Error(`No files for page ${page}`)
   }
+
+  return pageFiles
+}
+
+export function getContentOfPageFilesFromBuildManifest(
+  dir: string,
+  page: string
+): string {
+  const pageFiles = getPageFilesFromBuildManifest(dir, page)
+
+  return pageFiles
+    .map((file) => readFileSync(path.join(dir, '.next', file), 'utf8'))
+    .join('\n')
+}
+
+export function getPageFileFromBuildManifest(dir: string, page: string) {
+  const pageFiles = getPageFilesFromBuildManifest(dir, page)
 
   const pageFile = pageFiles[pageFiles.length - 1]
   expect(pageFile).toEndWith('.js')
@@ -1181,21 +1311,23 @@ export async function toggleCollapseComponentStack(
     .click()
 }
 
-export async function expandCallStack(
-  browser: BrowserInterface
-): Promise<void> {
-  // Open full Call Stack
-  await browser
-    .elementByCss('[data-nextjs-data-runtime-error-collapsed-action]')
-    .click()
+export async function hasRedboxCallStack(browser: BrowserInterface) {
+  return browser.eval(() => {
+    const portal = [].slice
+      .call(document.querySelectorAll('nextjs-portal'))
+      .find((p) => p.shadowRoot.querySelector('[data-nextjs-dialog-body]'))
+    const root = portal?.shadowRoot
+
+    return root?.querySelectorAll('[data-nextjs-call-stack-frame]').length > 0
+  })
 }
 
 export async function getRedboxCallStack(
   browser: BrowserInterface
-): Promise<string> {
+): Promise<string | null> {
   await browser.waitForElementByCss('[data-nextjs-call-stack-frame]', 30000)
 
-  const callStackFrameElements: any = await browser.elementsByCss(
+  const callStackFrameElements = await browser.elementsByCss(
     '[data-nextjs-call-stack-frame]'
   )
   const callStackFrameTexts = await Promise.all(
@@ -1203,6 +1335,23 @@ export async function getRedboxCallStack(
   )
 
   return callStackFrameTexts.join('\n').trim()
+}
+
+export async function getRedboxCallStackCollapsed(
+  browser: BrowserInterface
+): Promise<string> {
+  await browser.waitForElementByCss('.nextjs-container-errors-body', 30000)
+
+  const callStackFrameElements = await browser.elementsByCss(
+    '.nextjs-container-errors-body > [data-nextjs-codeframe] > :first-child, ' +
+      '.nextjs-container-errors-body > [data-nextjs-call-stack-frame], ' +
+      '.nextjs-container-errors-body > [data-nextjs-collapsed-call-stack-details] > summary'
+  )
+  const callStackFrameTexts = await Promise.all(
+    callStackFrameElements.map((f) => f.innerText())
+  )
+
+  return callStackFrameTexts.join('\n---\n').trim()
 }
 
 export async function getVersionCheckerText(
@@ -1412,3 +1561,80 @@ export const checkLink = (
   rel: string,
   content: string | string[]
 ) => checkMeta(browser, rel, content, 'rel', 'link', 'href')
+
+export async function getStackFramesContent(browser) {
+  const stackFrameElements = await browser.elementsByCss(
+    '[data-nextjs-call-stack-frame]'
+  )
+  const stackFramesContent = (
+    await Promise.all(
+      stackFrameElements.map(async (frame) => {
+        const functionNameEl = await frame.$('[data-nextjs-frame-expanded]')
+        const sourceEl = await frame.$('[data-has-source]')
+        const functionName = functionNameEl
+          ? await functionNameEl.innerText()
+          : ''
+        const source = sourceEl ? await sourceEl.innerText() : ''
+
+        if (!functionName) {
+          return ''
+        }
+        return `at ${functionName} (${source})`
+      })
+    )
+  )
+    .filter(Boolean)
+    .join('\n')
+
+  return stackFramesContent
+}
+
+export async function toggleCollapseCallStackFrames(browser: BrowserInterface) {
+  const button = await browser.elementByCss('[data-expand-ignore-button]')
+  const lastExpanded = await button.getAttribute('data-expand-ignore-button')
+  await button.click()
+
+  await retry(async () => {
+    const currExpanded = await button.getAttribute('data-expand-ignore-button')
+    expect(currExpanded).not.toBe(lastExpanded)
+  })
+}
+
+/**
+ * Encodes the params into a URLSearchParams object using the format that the
+ * now builder uses for route matches (adding the `nxtP` prefix to the keys).
+ *
+ * @param params - The params to encode.
+ * @param extraQueryParams - The extra query params to encode (without the `nxtP` prefix).
+ * @returns The encoded URLSearchParams object.
+ */
+export function createNowRouteMatches(
+  params: Record<string, string>,
+  extraQueryParams: Record<string, string> = {}
+): URLSearchParams {
+  const urlSearchParams = new URLSearchParams()
+  for (const [key, value] of Object.entries(params)) {
+    urlSearchParams.append(`nxtP${key}`, value)
+  }
+  for (const [key, value] of Object.entries(extraQueryParams)) {
+    urlSearchParams.append(key, value)
+  }
+
+  return urlSearchParams
+}
+
+export async function assertNoConsoleErrors(browser: BrowserInterface) {
+  const logs = await browser.log()
+  const warningsAndErrors = logs.filter((log) => {
+    return (
+      log.source === 'warning' ||
+      (log.source === 'error' &&
+        // These are expected when we visit 404 pages.
+        !log.message.startsWith(
+          'Failed to load resource: the server responded with a status of 404'
+        ))
+    )
+  })
+
+  expect(warningsAndErrors).toEqual([])
+}

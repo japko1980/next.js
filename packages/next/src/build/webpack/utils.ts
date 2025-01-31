@@ -6,7 +6,6 @@ import type {
   Module,
   ModuleGraph,
 } from 'webpack'
-import { isAppRouteRoute } from '../../lib/is-app-route-route'
 import type { ModuleGraphConnection } from 'webpack'
 
 export function traverseModules(
@@ -30,11 +29,11 @@ export function traverseModules(
       ) as Iterable<NormalModule>
       for (const mod of chunkModules) {
         const modId = compilation.chunkGraph.getModuleId(mod)?.toString()
-        callback(mod, chunk, chunkGroup, modId)
+        if (modId) callback(mod, chunk, chunkGroup, modId)
         const anyModule = mod as any
         if (anyModule.modules) {
           for (const subMod of anyModule.modules)
-            callback(subMod, chunk, chunkGroup, modId)
+            if (modId) callback(subMod, chunk, chunkGroup, modId)
         }
       }
     })
@@ -48,11 +47,7 @@ export function forEachEntryModule(
 ) {
   for (const [name, entry] of compilation.entries.entries()) {
     // Skip for entries under pages/
-    if (
-      name.startsWith('pages/') ||
-      // Skip for route.js entries
-      (name.startsWith('app/') && isAppRouteRoute(name))
-    ) {
+    if (name.startsWith('pages/')) {
       continue
     }
 
@@ -65,6 +60,7 @@ export function forEachEntryModule(
 
     if (
       !request.startsWith('next-edge-ssr-loader?') &&
+      !request.startsWith('next-edge-app-route-loader?') &&
       !request.startsWith('next-app-loader?')
     )
       continue
@@ -72,7 +68,10 @@ export function forEachEntryModule(
     let entryModule: NormalModule =
       compilation.moduleGraph.getResolvedModule(entryDependency)
 
-    if (request.startsWith('next-edge-ssr-loader?')) {
+    if (
+      request.startsWith('next-edge-ssr-loader?') ||
+      request.startsWith('next-edge-app-route-loader?')
+    ) {
       entryModule.dependencies.forEach((dependency) => {
         const modRequest: string | undefined = (dependency as any).request
         if (modRequest?.includes('next-app-loader')) {

@@ -17,7 +17,7 @@ import type { NextError } from '../../lib/is-error'
 import {
   TelemetryPlugin,
   type TelemetryPluginState,
-} from '../webpack/plugins/telemetry-plugin'
+} from '../webpack/plugins/telemetry-plugin/telemetry-plugin'
 import {
   NextBuildContext,
   resumePluginState,
@@ -82,6 +82,7 @@ export async function webpackBuildImpl(
   const nextBuildSpan = NextBuildContext.nextBuildSpan!
   const dir = NextBuildContext.dir!
   const config = NextBuildContext.config!
+  process.env.NEXT_COMPILER_NAME = compilerName || 'server'
 
   const runWebpackSpan = nextBuildSpan.traceChild('run-webpack-compiler')
   const entrypoints = await nextBuildSpan
@@ -188,7 +189,7 @@ export async function webpackBuildImpl(
   await runWebpackSpan.traceAsyncFn(async () => {
     if (config.experimental.webpackMemoryOptimizations) {
       stringBufferUtils.disableDualStringBufferCaching()
-      stringBufferUtils.enableStringInterning()
+      stringBufferUtils.enterStringInterningRange()
     }
 
     // Run the server compilers first and then the client
@@ -261,7 +262,7 @@ export async function webpackBuildImpl(
     }
 
     if (config.experimental.webpackMemoryOptimizations) {
-      stringBufferUtils.disableStringInterning()
+      stringBufferUtils.exitStringInterningRange()
     }
     inputFileSystem?.purge?.()
 
@@ -352,6 +353,7 @@ export async function webpackBuildImpl(
         usages: telemetryPlugin?.usages() || [],
         packagesUsedInServerSideProps:
           telemetryPlugin?.packagesUsedInServerSideProps() || [],
+        useCacheTracker: telemetryPlugin?.getUseCacheTracker() || {},
       },
     }
   }

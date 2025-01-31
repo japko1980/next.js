@@ -1,11 +1,11 @@
-import type { NextEnabledDirectories } from '../../server/base-server'
-
 import path from 'path'
 import { IncrementalCache } from '../../server/lib/incremental-cache'
-import { hasNextSupport } from '../../telemetry/ci-info'
+import { hasNextSupport } from '../../server/ci-info'
 import { nodeFs } from '../../server/lib/node-fs-methods'
 import { interopDefault } from '../../lib/interop-default'
 import { formatDynamicImportPath } from '../../lib/format-dynamic-import-path'
+import { cacheHandlerGlobal } from '../../server/use-cache/constants'
+import DefaultCacheHandler from '../../server/lib/cache-handlers/default'
 
 export async function createIncrementalCache({
   cacheHandler,
@@ -13,16 +13,18 @@ export async function createIncrementalCache({
   fetchCacheKeyPrefix,
   distDir,
   dir,
-  enabledDirectories,
   flushToDisk,
+  cacheHandlers,
+  requestHeaders,
 }: {
   cacheHandler?: string
   cacheMaxMemorySize?: number
   fetchCacheKeyPrefix?: string
   distDir: string
   dir: string
-  enabledDirectories: NextEnabledDirectories
   flushToDisk?: boolean
+  requestHeaders?: Record<string, string | string[] | undefined>
+  cacheHandlers?: Record<string, string | undefined>
 }) {
   // Custom cache handler overrides.
   let CacheHandler: any
@@ -34,11 +36,28 @@ export async function createIncrementalCache({
     )
   }
 
+  if (!cacheHandlerGlobal.__nextCacheHandlers && cacheHandlers) {
+    cacheHandlerGlobal.__nextCacheHandlers = {}
+
+    for (const key of Object.keys(cacheHandlers)) {
+      if (cacheHandlers[key]) {
+        ;(globalThis as any).__nextCacheHandlers[key] = interopDefault(
+          await import(formatDynamicImportPath(dir, cacheHandlers[key])).then(
+            (mod) => mod.default || mod
+          )
+        )
+      }
+    }
+
+    if (!cacheHandlers.default) {
+      cacheHandlerGlobal.__nextCacheHandlers.default = DefaultCacheHandler
+    }
+  }
+
   const incrementalCache = new IncrementalCache({
     dev: false,
-    requestHeaders: {},
+    requestHeaders: requestHeaders || {},
     flushToDisk,
-    fetchCache: true,
     maxMemoryCacheSize: cacheMaxMemorySize,
     fetchCacheKeyPrefix,
     getPrerenderManifest: () => ({
@@ -53,8 +72,6 @@ export async function createIncrementalCache({
       notFoundRoutes: [],
     }),
     fs: nodeFs,
-    pagesDir: enabledDirectories.pages,
-    appDir: enabledDirectories.app,
     serverDistDir: path.join(distDir, 'server'),
     CurCacheHandler: CacheHandler,
     minimalMode: hasNextSupport,

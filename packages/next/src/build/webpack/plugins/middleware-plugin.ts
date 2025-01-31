@@ -20,8 +20,8 @@ import {
   SUBRESOURCE_INTEGRITY_MANIFEST,
   NEXT_FONT_MANIFEST,
   SERVER_REFERENCE_MANIFEST,
-  PRERENDER_MANIFEST,
   INTERCEPTION_ROUTE_REWRITE_MANIFEST,
+  DYNAMIC_CSS_MANIFEST,
 } from '../../../shared/lib/constants'
 import type { MiddlewareConfig } from '../../analysis/get-page-static-info'
 import type { Telemetry } from '../../../telemetry/storage'
@@ -101,9 +101,7 @@ function getEntryFiles(
   entryFiles: string[],
   meta: EntryMetadata,
   hasInstrumentationHook: boolean,
-  opts: {
-    sriEnabled: boolean
-  }
+  opts: Options
 ) {
   const files: string[] = []
   if (meta.edgeSSR) {
@@ -121,9 +119,12 @@ function getEntryFiles(
           .map(
             (file) =>
               'server/' +
-              file.replace('.js', '_' + CLIENT_REFERENCE_MANIFEST + '.js')
+              file.replace(/\.js$/, '_' + CLIENT_REFERENCE_MANIFEST + '.js')
           )
       )
+    }
+    if (!opts.dev && !meta.edgeSSR.isAppDir) {
+      files.push(`server/${DYNAMIC_CSS_MANIFEST}.js`)
     }
 
     files.push(
@@ -138,10 +139,6 @@ function getEntryFiles(
     files.push(`server/edge-${INSTRUMENTATION_HOOK_FILENAME}.js`)
   }
 
-  if (process.env.NODE_ENV === 'production') {
-    files.push(PRERENDER_MANIFEST.replace('json', 'js'))
-  }
-
   files.push(
     ...entryFiles
       .filter((file) => !file.endsWith('.hot-update.js'))
@@ -154,7 +151,7 @@ function getEntryFiles(
 function getCreateAssets(params: {
   compilation: webpack.Compilation
   metadataByEntry: Map<string, EntryMetadata>
-  opts: Omit<Options, 'dev'>
+  opts: Options
 }) {
   const { compilation, metadataByEntry, opts } = params
   return (assets: any) => {
@@ -300,7 +297,9 @@ function isDynamicCodeEvaluationAllowed(
 
   const name = fileName.replace(rootDir ?? '', '')
 
-  return picomatch(middlewareConfig?.unstable_allowDynamicGlobs ?? [])(name)
+  return picomatch(middlewareConfig?.unstable_allowDynamic ?? [], {
+    dot: true,
+  })(name)
 }
 
 function buildUnsupportedApiError({
@@ -512,7 +511,11 @@ function getCodeAnalyzer(params: {
           sourceContent: source.toString(),
         })
 
-        if (!dev && isNodeJsModule(importedModule)) {
+        if (
+          !dev &&
+          isNodeJsModule(importedModule) &&
+          !SUPPORTED_NATIVE_MODULES.includes(importedModule)
+        ) {
           compilation.warnings.push(
             buildWebpackError({
               message: `A Node.js module is loaded ('${importedModule}' at line ${node.loc.start.line}) which is not supported in the Edge Runtime.
@@ -652,7 +655,7 @@ function getExtractMetadata(params: {
           if (/node_modules[\\/]regenerator-runtime[\\/]runtime\.js/.test(id)) {
             continue
           }
-          if (route?.middlewareConfig?.unstable_allowDynamicGlobs) {
+          if (route?.middlewareConfig?.unstable_allowDynamic) {
             telemetry?.record({
               eventName: 'NEXT_EDGE_ALLOW_DYNAMIC_USED',
               payload: {
@@ -815,6 +818,7 @@ export default class MiddlewarePlugin {
             sriEnabled: this.sriEnabled,
             rewrites: this.rewrites,
             edgeEnvironments: this.edgeEnvironments,
+            dev: this.dev,
           },
         })
       )
@@ -862,7 +866,7 @@ export async function handleWebpackExternalForEdgeRuntime({
     try {
       await getResolve()(context, request)
     } catch {
-      return `root  globalThis.__import_unsupported('${request}')`
+      return `root globalThis.__import_unsupported('${request}')`
     }
   }
 }
