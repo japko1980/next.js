@@ -53,16 +53,22 @@ function ErrorDescription({
       ? ''
       : error.name + ': '
 
-  // If it's replayed error, display the environment name
   const environmentName =
-    'environmentName' in error ? error['environmentName'] : ''
+    'environmentName' in error ? error.environmentName : ''
   const envPrefix = environmentName ? `[ ${environmentName} ] ` : ''
+
+  // The environment name will be displayed as a label, so remove it
+  // from the message (e.g. "[ Server ] hello world" -> "hello world").
+  let message = error.message
+  if (message.startsWith(envPrefix)) {
+    message = message.slice(envPrefix.length)
+  }
+
   return (
     <>
-      {envPrefix}
       {title}
       <HotlinkedText
-        text={hydrationWarning || error.message}
+        text={hydrationWarning || message}
         matcher={isNextjsLink}
       />
     </>
@@ -267,7 +273,7 @@ export const styles = css`
     margin-bottom: var(--size-3_5);
   }
   .error-overlay-notes-container {
-    padding: 0 var(--size-4);
+    margin: var(--size-2) var(--size-0_5);
   }
   .error-overlay-notes-container p {
     white-space: pre-wrap;
